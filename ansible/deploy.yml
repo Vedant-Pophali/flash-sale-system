@@ -1,0 +1,17 @@
+---
+- name: Provision and Deploy Flash-Sale High-Concurrency Stack
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Verify Docker Engine is active
+      command: docker info
+      changed_when: false
+
+    - name: Spin up Redis, RabbitMQ, and MySQL stateful containers
+      command: docker compose up -d
+      args:
+        chdir: ..
+
+    - name: Seed initial inventory key in Redis
+      command: docker exec flash_redis redis-cli SETNX inventory:product:1 500
+      changed_when: false

@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Festival Flash Sale — High Concurrency Engine</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      gap: 1.5rem;
+    }
+
+    .card {
+      background: #1e293b;
+      padding: 2rem;
+      border-radius: 12px;
+      width: 420px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      text-align: center;
+      border: 1px solid #334155;
+    }
+
+    .badge {
+      background: #ef4444;
+      color: white;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    h1 {
+      font-size: 1.4rem;
+      margin: 1rem 0 0.4rem;
+    }
+
+    p {
+      color: #94a3b8;
+      font-size: 0.88rem;
+      margin-bottom: 1.5rem;
+    }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #3b82f6;
+      color: white;
+      transition: all 0.2s;
+    }
+
+    button:hover:not(:disabled) {
+      background: #2563eb;
+    }
+
+    button:disabled {
+      background: #475569;
+      cursor: not-allowed;
+      opacity: 0.75;
+    }
+
+    .btn-secondary {
+      background: #334155;
+      margin-top: 0.75rem;
+      font-size: 0.82rem;
+      padding: 8px;
+    }
+
+    .btn-secondary:hover {
+      background: #475569;
+    }
+
+    #status-box {
+      margin-top: 1rem;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      display: none;
+      font-weight: 500;
+    }
+
+    .queued {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .confirmed {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .failed {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .telemetry {
+      background: #090d16;
+      padding: 1.25rem;
+      border-radius: 12px;
+      width: 420px;
+      border: 1px solid #1e293b;
+      font-family: monospace;
+      font-size: 0.82rem;
+    }
+
+    .telemetry h3 {
+      margin: 0 0 0.75rem;
+      color: #38bdf8;
+      font-size: 0.9rem;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.6rem;
+    }
+
+    .metric {
+      background: #1e293b;
+      padding: 0.6rem;
+      border-radius: 6px;
+    }
+
+    .metric span {
+      display: block;
+      color: #94a3b8;
+      font-size: 0.72rem;
+    }
+
+    .metric strong {
+      font-size: 1.1rem;
+      color: #f8fafc;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <span class="badge">Live Flash Sale • 500 Units</span>
+    <h1>Flagship Smartphone 5G</h1>
+    <p>Protected by Atomic Redis Lua Gatekeeper & Async RabbitMQ Consumers</p>
+    <button id="buy-btn" onclick="initiateCheckout()">Buy Now — $699</button>
+    <div id="status-box"></div>
+    <button class="btn-secondary" onclick="resetStock()">↻ Reset Inventory to 500 (Admin Demo)</button>
+  </div>
+
+  <div class="telemetry">
+    <h3><span>⚡ LIVE SYSTEM TELEMETRY</span> <span id="sync-badge" style="color:#4ade80">● ACID SYNCED</span></h3>
+    <div class="grid">
+      <div class="metric"><span>Redis Atomic Stock</span><strong id="m-redis">500</strong></div>
+      <div class="metric"><span>MySQL Persisted Stock</span><strong id="m-mysql">500</strong></div>
+      <div class="metric"><span>Confirmed Orders (DB)</span><strong id="m-orders">0</strong></div>
+      <div class="metric"><span>Total Requests Ingested</span><strong id="m-req">0</strong></div>
+      <div class="metric"><span>Sold-Out Fast Rejects</span><strong id="m-soldout">0</strong></div>
+      <div class="metric"><span>Bot Requests Blocked</span><strong id="m-bots">0</strong></div>
+    </div>
+  </div>
+
+  <script>
+    let isLocked = false;
+    let idempotencyKey = crypto.randomUUID();
+    let userId = "user_" + Math.floor(Math.random() * 1000000);
+
+    function updateStatus(text, cssClass) {
+      const box = document.getElementById("status-box");
+      box.style.display = "block";
+      box.className = cssClass;
+      box.innerText = text;
+    }
+
+    async function initiateCheckout() {
+      if (isLocked) return;
+      isLocked = true;
+      const btn = document.getElementById("buy-btn");
+      btn.disabled = true;
+      btn.innerText = "Reserving Inventory...";
+
+      try {
+        const res = await fetch("/api/v1/checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Idempotency-Key": idempotencyKey },
+          body: JSON.stringify({ user_id: userId, product_id: 1 })
+        });
+        const data = await res.json();
+
+        if (res.status === 202) {
+          updateStatus("202 Accepted: Queued in RabbitMQ. Polling DB confirmation...", "queued");
+          pollOrderStatus(data.order_id);
+        } else if (res.status === 409) {
+          btn.innerText = "Sold Out";
+          updateStatus("409 Conflict: All 500 units claimed.", "failed");
+        } else {
+          throw new Error(data.detail || "Request rejected");
+        }
+      } catch (err) {
+        updateStatus("Error: " + err.message, "failed");
+        btn.disabled = false;
+        btn.innerText = "Retry Buy Now";
+        isLocked = false;
+      }
+    }
+
+    function pollOrderStatus(orderId) {
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/v1/orders/${orderId}`);
+          const data = await res.json();
+          if (data.status === "CONFIRMED") {
+            clearInterval(interval);
+            document.getElementById("buy-btn").innerText = "Order Confirmed ✓";
+            updateStatus(`Order ${orderId.slice(0, 8)} committed to MySQL with ACID guarantee.`, "confirmed");
+            fetchTelemetry();
+          } else if (data.status.startsWith("FAILED")) {
+            clearInterval(interval);
+            document.getElementById("buy-btn").innerText = "Sold Out";
+            updateStatus("Inventory exhausted during DB verification.", "failed");
+          }
+        } catch (e) { }
+      }, 500);
+    }
+
+    async function fetchTelemetry() {
+      try {
+        const res = await fetch("/api/v1/metrics");
+        const d = await res.json();
+        document.getElementById("m-redis").innerText = d.redis_atomic_stock;
+        document.getElementById("m-mysql").innerText = d.mysql_persisted_stock;
+        document.getElementById("m-orders").innerText = d.confirmed_orders_count;
+        document.getElementById("m-req").innerText = d.total_requests_ingested;
+        document.getElementById("m-soldout").innerText = d.sold_out_fast_rejections;
+        document.getElementById("m-bots").innerText = d.bot_requests_rate_limited;
+      } catch (e) { }
+    }
+
+    async function resetStock() {
+      await fetch("/api/v1/admin/reset", { method: "POST" });
+      isLocked = false;
+      idempotencyKey = crypto.randomUUID();
+      userId = "user_" + Math.floor(Math.random() * 1000000);
+      const btn = document.getElementById("buy-btn");
+      btn.disabled = false;
+      btn.innerText = "Buy Now — $699";
+      document.getElementById("status-box").style.display = "none";
+      fetchTelemetry();
+    }
+
+    setInterval(fetchTelemetry, 1500);
+    fetchTelemetry();
+  </script>
+</body>
+
+</html>
