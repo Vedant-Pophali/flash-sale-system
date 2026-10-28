@@ -3,9 +3,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     GATEWAY_HOST: str = "127.0.0.1"
     GATEWAY_PORT: int = 8000
+    CDN_EDGE_URL: str = "http://127.0.0.1:8080"
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
-    REDIS_POOL_SIZE: int = 200
+    REDIS_POOL_SIZE: int = 300
     RABBITMQ_URL: str = "amqp://guest:guest@localhost:5672/"
     RABBITMQ_HOST: str = "localhost"
     MYSQL_HOST: str = "localhost"
@@ -17,18 +18,18 @@ class Settings(BaseSettings):
     QUEUE_NAME: str = "checkout_queue"
     DLX_NAME: str = "checkout_dlx"
     DLQ_NAME: str = "checkout_dlq"
-    WORKER_PREFETCH_COUNT: int = 20
+    WORKER_PREFETCH_COUNT: int = 100
 
     DEFAULT_PRODUCT_ID: int = 1
     DEFAULT_INITIAL_STOCK: int = 500
     RATE_LIMIT_MAX_REQUESTS: int = 5
     RATE_LIMIT_WINDOW_SECONDS: int = 10
-    RESERVATION_TTL_SECONDS: int = 15
-    REAPER_INTERVAL_SECONDS: int = 2
+    RESERVATION_TTL_SECONDS: int = 60
+    REAPER_INTERVAL_SECONDS: int = 3
 
-    LOADTEST_LEGITIMATE_USERS: int = 2500
-    LOADTEST_BOT_REQUESTS: int = 200
-    LOADTEST_CONCURRENCY: int = 150
+    LOADTEST_LEGITIMATE_USERS: int = 100000
+    LOADTEST_BOT_REQUESTS: int = 5000
+    LOADTEST_CONCURRENCY: int = 250
     SIMULATED_PAYMENT_RATIO: float = 0.90
 
     @property
