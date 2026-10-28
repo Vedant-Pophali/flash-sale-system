@@ -8,7 +8,7 @@ import httpx
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
 
-BATCH_SIZE = 250  # Multiplexes 250 unique customer requests per HTTP frame to avoid Windows socket exhaustion
+BATCH_SIZE = 250
 
 
 async def batch_worker(
@@ -23,24 +23,29 @@ async def batch_worker(
         except asyncio.QueueEmpty:
             break
 
-        try:
-            resp = await client.post(
-                f"{settings.gateway_url}/api/v1/checkout/batch",
-                json={"items": batch_items},
-                timeout=30.0
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                stats[202] += data["c_202"]
-                stats[409] += data["c_409"]
-                stats[429] += data["c_429"]
-                reserved_orders.extend(data["reserved_ids"])
-            else:
-                stats[500] += len(batch_items)
-        except Exception:
+        success = False
+        for attempt in range(3):
+            try:
+                resp = await client.post(
+                    f"{settings.gateway_url}/api/v1/checkout/batch",
+                    json={"items": batch_items},
+                    timeout=30.0
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    stats[202] += data["c_202"]
+                    stats[409] += data["c_409"]
+                    stats[429] += data["c_429"]
+                    reserved_orders.extend(data["reserved_ids"])
+                    success = True
+                    break
+            except Exception:
+                await asyncio.sleep(0.05 * (attempt + 1))
+
+        if not success:
             stats[500] += len(batch_items)
-        finally:
-            batches_queue.task_done()
+
+        batches_queue.task_done()
 
 
 async def pay_order_batch(client: httpx.AsyncClient, order_ids: list, concurrency: int = 25) -> int:
@@ -66,11 +71,17 @@ async def pay_order_batch(client: httpx.AsyncClient, order_ids: list, concurrenc
 def build_customer_batches(total_requests: int, bot_requests: int, product_id: int) -> asyncio.Queue:
     q = asyncio.Queue()
     current_batch = []
+    bots_added = 0
+    legit_added = 0
+    legit_target = total_requests - bot_requests
+
     for idx in range(total_requests):
-        if idx < bot_requests:
-            uid = f"scalper_bot_{idx % 50}"
+        if bots_added < bot_requests and (idx % 20 == 0 or legit_added >= legit_target):
+            uid = f"scalper_bot_{bots_added % 50}"
+            bots_added += 1
         else:
-            uid = f"customer_{idx}"
+            uid = f"customer_{legit_added}"
+            legit_added += 1
 
         current_batch.append({
             "user_id": uid,
@@ -89,7 +100,7 @@ def build_customer_batches(total_requests: int, bot_requests: int, product_id: i
 async def run_95k_lifecycle_simulation():
     legit_users = getattr(settings, "LOADTEST_LEGITIMATE_USERS", 95000)
     bot_requests = getattr(settings, "LOADTEST_BOT_REQUESTS", 5000)
-    concurrency = 20
+    concurrency = 16
     total_wave1 = legit_users + bot_requests
 
     print("=" * 80)
@@ -138,24 +149,29 @@ async def run_95k_lifecycle_simulation():
             f"429 Bots Blocked: {stats[429]:,} | Errors: {stats[500]}"
         )
 
-        # Stage 3: Wait for RabbitMQ Consumer to Persist the 500 Reservations
-        print(f"\n[Stage 3/6] Waiting for RabbitMQ worker to commit {len(reserved_orders)} reservations to MySQL...")
+        # Stage 3: Wait for RabbitMQ Consumer to Persist All 500 Reservations to MySQL
+        target_stock = settings.DEFAULT_INITIAL_STOCK
+        print(f"\n[Stage 3/6] Waiting for RabbitMQ worker to commit {target_stock} reservations to MySQL...")
         while True:
             m = (await client.get(f"{settings.gateway_url}/api/v1/metrics")).json()
-            print(f"   -> MySQL Persisted Reservations: {m['pending_payment_orders']} / {len(reserved_orders)}", end="\r")
-            if m["pending_payment_orders"] >= len(reserved_orders):
+            print(f"   -> MySQL Persisted Reservations: {m['pending_payment_orders']} / {target_stock}", end="\r")
+            if m["pending_payment_orders"] >= target_stock:
                 print()
                 break
             await asyncio.sleep(0.3)
 
+        # Fetch authoritative list of 500 reserved orders directly from MySQL
+        p_resp = (await client.get(f"{settings.gateway_url}/api/v1/orders/pending/list")).json()
+        db_reserved_orders = p_resp["pending_order_ids"]
+
         # Stage 4: Simulate 90% Immediate Payment & 10% Cart Abandonment
-        pay_target = int(len(reserved_orders) * settings.SIMULATED_PAYMENT_RATIO)
-        abandoned_target = len(reserved_orders) - pay_target
-        orders_to_pay = reserved_orders[:pay_target]
+        pay_target = int(len(db_reserved_orders) * settings.SIMULATED_PAYMENT_RATIO)
+        abandoned_target = len(db_reserved_orders) - pay_target
+        orders_to_pay = db_reserved_orders[:pay_target]
 
         print(f"[Stage 4/6] Processing payments: {pay_target} customers pay, {abandoned_target} abandon checkout...")
         wave1_paid = await pay_order_batch(client, orders_to_pay, concurrency=25)
-        actual_abandoned = len(reserved_orders) - wave1_paid
+        actual_abandoned = len(db_reserved_orders) - wave1_paid
 
         # Stage 5: Trigger TTL Reaper Sweep to Reclaim Unpaid Inventory
         print(f"[Stage 5/6] Triggering Atomic TTL Reaper to reclaim {actual_abandoned} unpaid reservations...")
@@ -173,17 +189,18 @@ async def run_95k_lifecycle_simulation():
 
         w2_workers = [
             asyncio.create_task(batch_worker(client, w2_q, w2_stats, w2_orders))
-            for _ in range(5)
+            for _ in range(4)
         ]
         await asyncio.gather(*w2_workers)
 
         while True:
             m = (await client.get(f"{settings.gateway_url}/api/v1/metrics")).json()
-            if m["pending_payment_orders"] >= len(w2_orders):
+            if m["pending_payment_orders"] >= reclaimed_units:
                 break
             await asyncio.sleep(0.2)
 
-        wave2_paid = await pay_order_batch(client, w2_orders, concurrency=25)
+        p2_resp = (await client.get(f"{settings.gateway_url}/api/v1/orders/pending/list")).json()
+        wave2_paid = await pay_order_batch(client, p2_resp["pending_order_ids"], concurrency=25)
         final_m = (await client.get(f"{settings.gateway_url}/api/v1/metrics")).json()
 
         # Final Audit Report

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -20,6 +21,7 @@ from worker.reaper import sweep_expired_reservations
 redis_client: redis.Redis = None
 rabbit_connection: aio_pika.RobustConnection = None
 rabbit_channel: aio_pika.Channel = None
+rabbit_lock: asyncio.Lock = None
 lua_script_sha: str = None
 recent_latencies = []
 
@@ -51,25 +53,37 @@ def get_db_connection():
 async def seed_redis_state(product_id: int, stock: int):
     global lua_script_sha, recent_latencies
     recent_latencies.clear()
-    await redis_client.setnx(f"inventory:product:{product_id}", stock)
-    await redis_client.setnx(f"metrics:mysql_persisted_stock:{product_id}", stock)
-    await redis_client.setnx(f"metrics:pending_payment:{product_id}", 0)
-    await redis_client.setnx(f"metrics:paid_orders:{product_id}", 0)
-    await redis_client.setnx(f"metrics:reclaimed_stock:{product_id}", 0)
-    await redis_client.setnx("metrics:total_requests", 0)
-    await redis_client.setnx("metrics:rate_limited", 0)
-    await redis_client.setnx("metrics:sold_out_rejections", 0)
-    await redis_client.setnx("metrics:duplicate_requests", 0)
-    await redis_client.setnx("metrics:dlq_count", 0)
+    await redis_client.set(f"inventory:product:{product_id}", stock)
+    await redis_client.set(f"metrics:mysql_persisted_stock:{product_id}", stock)
+    await redis_client.set(f"metrics:pending_payment:{product_id}", 0)
+    await redis_client.set(f"metrics:paid_orders:{product_id}", 0)
+    await redis_client.set(f"metrics:reclaimed_stock:{product_id}", 0)
+    await redis_client.set("metrics:total_requests", 0)
+    await redis_client.set("metrics:rate_limited", 0)
+    await redis_client.set("metrics:sold_out_rejections", 0)
+    await redis_client.set("metrics:duplicate_requests", 0)
+    await redis_client.set("metrics:dlq_count", 0)
 
     with open(os.path.join(os.path.dirname(__file__), "stock.lua"), "r") as f:
         lua_script_sha = await redis_client.script_load(f.read())
 
+async def publish_events_safe(events: list):
+    """Thread-safe serialized RabbitMQ publisher that never blocks the HTTP response."""
+    async with rabbit_lock:
+        for ev in events:
+            await rabbit_channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(ev).encode(),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                ),
+                routing_key=settings.QUEUE_NAME
+            )
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, rabbit_connection, rabbit_channel
+    global redis_client, rabbit_connection, rabbit_channel, rabbit_lock
+    rabbit_lock = asyncio.Lock()
     
-    # Compact, auto-healing IPv4 connection pool prevents Docker Desktop WinError 64 resets
     pool = redis.ConnectionPool.from_url(
         settings.redis_url,
         max_connections=settings.REDIS_POOL_SIZE,
@@ -82,7 +96,7 @@ async def lifespan(app: FastAPI):
     await seed_redis_state(settings.DEFAULT_PRODUCT_ID, settings.DEFAULT_INITIAL_STOCK)
         
     rabbit_connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
-    rabbit_channel = await rabbit_connection.channel()
+    rabbit_channel = await rabbit_connection.channel(publisher_confirms=False)
     
     dlx = await rabbit_channel.declare_exchange(settings.DLX_NAME, aio_pika.ExchangeType.DIRECT, durable=True)
     dlq = await rabbit_channel.declare_queue(settings.DLQ_NAME, durable=True)
@@ -175,13 +189,7 @@ async def checkout(
         "ttl_seconds": settings.RESERVATION_TTL_SECONDS,
         "timestamp": datetime.utcnow().isoformat()
     }
-    await rabbit_channel.default_exchange.publish(
-        aio_pika.Message(
-            body=json.dumps(order_event).encode(),
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT
-        ),
-        routing_key=settings.QUEUE_NAME
-    )
+    asyncio.create_task(publish_events_safe([order_event]))
 
     return {
         "status": "QUEUED",
@@ -194,11 +202,6 @@ async def checkout(
 
 @app.post("/api/v1/checkout/batch")
 async def checkout_batch(payload: BatchCheckoutRequest, request: Request):
-    """
-    High-Throughput Edge Multiplexer: Executes the exact atomic Redis Lua script for each
-    customer in a pipelined frame so 100,000 requests can be benchmarked on a single Windows host
-    without Docker Desktop NAT port exhaustion (WinError 64).
-    """
     t_start = time.perf_counter()
     client_ip = request.client.host if request.client else "127.0.0.1"
 
@@ -229,6 +232,7 @@ async def checkout_batch(payload: BatchCheckoutRequest, request: Request):
     c_409 = 0
     c_429 = 0
     reserved_ids = []
+    events_to_publish = []
     now_iso = datetime.utcnow().isoformat()
 
     for item, res in zip(payload.items, results):
@@ -239,20 +243,16 @@ async def checkout_batch(payload: BatchCheckoutRequest, request: Request):
         elif res >= 0:
             c_202 += 1
             reserved_ids.append(item.idempotency_key)
-            order_event = {
+            events_to_publish.append({
                 "order_id": item.idempotency_key,
                 "user_id": item.user_id,
                 "product_id": item.product_id,
                 "ttl_seconds": settings.RESERVATION_TTL_SECONDS,
                 "timestamp": now_iso
-            }
-            await rabbit_channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=json.dumps(order_event).encode(),
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
-                ),
-                routing_key=settings.QUEUE_NAME
-            )
+            })
+
+    if events_to_publish:
+        asyncio.create_task(publish_events_safe(events_to_publish))
 
     return {
         "c_202": c_202,
@@ -260,6 +260,22 @@ async def checkout_batch(payload: BatchCheckoutRequest, request: Request):
         "c_429": c_429,
         "reserved_ids": reserved_ids
     }
+
+@app.get("/api/v1/orders/pending/list")
+async def list_pending_orders(product_id: int = settings.DEFAULT_PRODUCT_ID):
+    """Returns all currently active PENDING_PAYMENT order IDs from MySQL."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT order_id FROM orders WHERE product_id = %s AND status = 'PENDING_PAYMENT'",
+            (product_id,)
+        )
+        rows = [r[0] for r in cursor.fetchall()]
+        return {"pending_order_ids": rows, "count": len(rows)}
+    finally:
+        cursor.close()
+        conn.close()
 
 @app.post("/api/v1/orders/{order_id}/pay")
 async def pay_for_order(order_id: str, product_id: int = settings.DEFAULT_PRODUCT_ID):
@@ -366,6 +382,17 @@ async def get_live_metrics(product_id: int = settings.DEFAULT_PRODUCT_ID):
 
 @app.post("/api/v1/admin/reset")
 async def reset_system(payload: ResetRequest = ResetRequest()):
+    q = await rabbit_channel.declare_queue(
+        settings.QUEUE_NAME,
+        durable=True,
+        arguments={
+            "x-dead-letter-exchange": settings.DLX_NAME,
+            "x-dead-letter-routing-key": settings.DLQ_NAME
+        }
+    )
+    await q.purge()
+    await asyncio.sleep(0.4)
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -380,16 +407,6 @@ async def reset_system(payload: ResetRequest = ResetRequest()):
     conn.commit()
     cursor.close()
     conn.close()
-
-    q = await rabbit_channel.declare_queue(
-        settings.QUEUE_NAME,
-        durable=True,
-        arguments={
-            "x-dead-letter-exchange": settings.DLX_NAME,
-            "x-dead-letter-routing-key": settings.DLQ_NAME
-        }
-    )
-    await q.purge()
 
     await redis_client.flushdb()
     await seed_redis_state(payload.product_id, payload.initial_stock)

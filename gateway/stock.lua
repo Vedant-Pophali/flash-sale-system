@@ -4,15 +4,20 @@
 -- KEYS[4]: rate limit key ("ratelimit:<ip>:<user_id>")
 -- ARGV[1]: max requests per window (e.g., 5)
 -- ARGV[2]: rate limit window in seconds (e.g., 10)
+-- ARGV[3]: optional TTL in seconds (defaults to 3600 if not passed)
+
+local max_req = tonumber(ARGV[1]) or 5
+local window_sec = tonumber(ARGV[2]) or 10
+local state_ttl = tonumber(ARGV[3]) or 3600
 
 redis.call("INCR", "metrics:total_requests")
 
--- 1. Atomic Edge Rate Limiting (Blocks Bot Attacks in the same RTT)
+-- 1. Atomic Edge Rate Limiting (Blocks Bot Attacks in 1-RTT)
 local req_count = redis.call("INCR", KEYS[4])
 if req_count == 1 then
-    redis.call("EXPIRE", KEYS[4], tonumber(ARGV[2]))
+    redis.call("EXPIRE", KEYS[4], window_sec)
 end
-if req_count > tonumber(ARGV[1]) then
+if req_count > max_req then
     redis.call("INCR", "metrics:rate_limited")
     return -3 -- Code -3: Bot Rate Limit Exceeded (HTTP 429)
 end
@@ -32,8 +37,8 @@ end
 
 -- 4. Atomic Decrement & Reservation State
 local remaining = redis.call("DECR", KEYS[1])
-redis.call("SET", KEYS[2], "1", "EX", 3600)
-redis.call("SET", KEYS[3], "QUEUED", "EX", 3600)
+redis.call("SET", KEYS[2], "1", "EX", state_ttl)
+redis.call("SET", KEYS[3], "QUEUED", "EX", state_ttl)
 redis.call("INCR", "metrics:reserved_queued")
 
-return remaining -- Returns remaining stock (499 down to 0)
+return remaining
