@@ -184,22 +184,3 @@ Open http://127.0.0.1:8000 in your browser to interact with the UI and watch the
 
 ---
 
-## 6. Commit and Push to GitHub
-
-Before pushing, make sure `.gitignore` excludes `venv/` and `__pycache__/`. Run these commands in PowerShell inside `D:\goML Project\flash-sale-system`:
-
-```powershell
-# Ensure venv and caches are ignored
-@"
-venv/
-__pycache__/
-*.pyc
-.DS_Store
-"@ | Set-Content -Path ".gitignore"
-
-# Stage, commit, and push all updated files and README.md
-git status
-git add .
-git commit -m "feat: complete 100k flash-sale engine with 1-RTT Lua gatekeeper, TTL reaper, and ACID audit"
-git push origin main
-```
