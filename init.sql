@@ -12,8 +12,10 @@ CREATE TABLE IF NOT EXISTS orders (
     order_id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL,
     product_id INT NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    status VARCHAR(30) NOT NULL,
+    expires_at DATETIME NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_status_expires (status, expires_at)
 );
 
 INSERT INTO inventory (product_id, product_name, stock) 
